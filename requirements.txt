@@ -1,0 +1,9 @@
+langchain-openai>=0.0.2
+langgraph>=0.0.15
+langserve>=0.0.34
+fastapi>=0.104.1
+uvicorn>=0.24.0
+python-dotenv>=1.0.0
+pydantic>=2.5.2
+typing-extensions>=4.8.0
+sse-starlette>=1.8.2
