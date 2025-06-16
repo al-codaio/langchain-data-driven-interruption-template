@@ -1,15 +1,16 @@
+from dotenv import load_dotenv
+load_dotenv()
 import os
+
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from langserve import add_routes
 from langchain_core.messages import BaseMessage, HumanMessage
 from typing import List, Optional, Dict, Any
+from pydantic import Field
 
 from graph import create_graph
 from models import AgentState
-
-from dotenv import load_dotenv
-load_dotenv()
 
 app = FastAPI(
     title="LangGraph data driven interruption template",
@@ -34,12 +35,7 @@ async def test_graph(input_data: Dict[str, Any] = None):
         
         print(f"Graph result: {result}")
         
-        return {
-            "status": "success",
-            "input": input_data.get("input", str(input_data)),
-            "output": result.get("output", "No output generated"),
-            "state": result.get("state", {})
-        }
+        return result
     except Exception as e:
         print(f"Error in test endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

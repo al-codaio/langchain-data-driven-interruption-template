@@ -1,9 +1,10 @@
 import os
+import json
+import traceback
 from typing import List, Optional, Union, Dict, Any
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END, START
 from langgraph.types import interrupt, Command
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -36,7 +37,12 @@ def validate_state_and_interrupt(state: AgentState) -> Command[str] | AgentState
 
     if missing:
         prompt_template = ChatPromptTemplate.from_messages([
-            ("system", """You are a helpful assistant. Based on the missing fields, generate a polite message asking the user to provide the information. List the missing fields clearly and suggest how to provide them, e.g., 'Email: your@email.com, Document ID: 123'. Focus on one missing field at a time if there are many, or prioritize based on importance."""),
+            ("system", """You are a helpful assistant. Based on the missing fields, 
+            generate a polite message asking the user to provide the information. 
+            Keep the message short and concise. List the missing fields clearly and 
+            suggest how to provide them, e.g., 'Email: your@email.com, Document ID: 123'. 
+            Focus on one missing field at a time if there are many, or prioritize based on importance.
+            """),
             ("user", "The following fields are missing: {missing_fields}. Please ask the user to provide them.")
         ])
         llm_chain = prompt_template | llm
@@ -53,14 +59,8 @@ def validate_state_and_interrupt(state: AgentState) -> Command[str] | AgentState
             state.messages = [AIMessage(content=user_prompt_message)]
 
         print(f"Interrupting for missing fields: {missing}")
-        return Command(
-            interrupt=user_prompt_message,
-            update={
-                "messages": state.messages,
-                "missing_fields": missing,
-                "next_node_after_validation": target_node
-            }
-        )
+        state.missing_fields = missing
+        return interrupt(user_prompt_message)
     else:
         print("All required fields present. Proceeding to target node.")
         state.missing_fields = []
@@ -91,111 +91,168 @@ def process_user_input(state: AgentState) -> AgentState:
     This node processes the user's response after an interrupt.
     It expects the user to provide the missing fields.
     """
-    print(f"\n--- Running process_user_input node ---")
+    print(f"[DEBUG] process_user_input entered with missing_fields: {state.missing_fields}")
     
     last_message = state.messages[-1]
+    print(f"[DEBUG] last_message type: {type(last_message)}, content: {getattr(last_message, 'content', None)}")
+    is_human = False
     if isinstance(last_message, HumanMessage):
+        is_human = True
+    elif isinstance(last_message, BaseMessage) and getattr(last_message, 'type', None) == 'human':
+        is_human = True
+
+    if not state.missing_fields and state.next_node_after_validation:
+        from models import NODE_REQUIREMENTS
+        state.missing_fields = NODE_REQUIREMENTS.get(state.next_node_after_validation, [])
+
+    if is_human:
         user_response = last_message.content
         print(f"User response received: '{user_response}'")
 
         extraction_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a helpful assistant that extracts information from user messages.
-             Extract the following fields from the user's message: {fields_to_extract}.
-             Respond with a JSON object. If a field is not found, omit it.
-             Example: {{"email": "user@example.com", "document_id": "doc123"}}
-             """),
+            ("system", """You are a helpful assistant that extracts information from user messages.\nExtract the following fields from the user's message: {fields_to_extract}.\nRespond ONLY with a valid JSON object using the field names as keys. If a field is not found, omit it.\nDo not include any explanation or extra text.\n"""),
             ("user", "User message: {user_message}")
         ])
         extraction_llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini"), temperature=0.0)
         
         fields_to_extract_str = ", ".join(state.missing_fields)
-        
-        try:
-            import json
-            llm_extraction_result = extraction_llm.invoke({
-                "fields_to_extract": fields_to_extract_str,
-                "user_message": user_response
-            }).content
-            
-            provided_info = json.loads(llm_extraction_result.strip().strip('`').strip('json'))
-        except (json.JSONDecodeError, Exception) as e:
-            print(f"LLM extraction/JSON parse error: {e}. Raw LLM output: {llm_extraction_result}")
-            provided_info = {}
+        print(f"[DEBUG] fields_to_extract_str before extraction: {fields_to_extract_str}")
+        if fields_to_extract_str:
+            prompt_value = None
+            llm_response_obj = None
+            llm_extraction_result = None
+            updated_any_field = False
+            try:
+                print(f"[DEBUG] Extraction prompt input: fields_to_extract={fields_to_extract_str}, user_message={user_response}")
+                prompt_value = extraction_prompt.format_prompt(fields_to_extract=fields_to_extract_str, user_message=user_response)
+                print(f"[DEBUG] prompt_value assigned")
+                llm_response_obj = extraction_llm.invoke(prompt_value)
+                print(f"[DEBUG] llm_response_obj assigned")
+                print(f"[DEBUG] Full LLM response object: {llm_response_obj!r}")
+                llm_extraction_result = getattr(llm_response_obj, "content", None)
+                print(f"[DEBUG] Raw LLM extraction result: {llm_extraction_result!r}")
+                provided_info = json.loads(llm_extraction_result.strip().strip('`').strip('json'))
+                print(f"Extracted info: {provided_info}")
+                user_email = provided_info.get("user_email")
+                if user_email and not state.user_email:
+                    state.user_email = user_email
+                    updated_any_field = True
+                if "document_id" in provided_info and provided_info["document_id"] and not state.document_id:
+                    print(f"[DEBUG] Setting state.document_id = {provided_info['document_id']}")
+                    state.document_id = provided_info["document_id"]
+                    updated_any_field = True
+                
+                if not updated_any_field and state.missing_fields:
+                    state.messages.append(AIMessage(content="I'm sorry, I couldn't find the requested information in your message. Please try again. For example, 'Email: your@email.com, Document ID: 123'."))
+                    return state
+                elif updated_any_field:
+                    state.messages.append(AIMessage(content="Thank you! Let me check those details."))
+                    state.missing_fields = []
+                    # Route to orchestrator to continue the flow, and persist updated fields
+                    return Command(
+                        goto="orchestrator",
+                        update={
+                            "user_email": state.user_email,
+                            "document_id": state.document_id,
+                            "missing_fields": [],
+                            "messages": state.messages,
+                        }
+                    )
+            except Exception as e:
+                print(f"LLM extraction error: {e!r}")
+                traceback.print_exc()
+                if prompt_value is not None:
+                    print(f"[DEBUG] prompt_value: {prompt_value!r}")
+                if llm_response_obj is not None:
+                    print(f"[DEBUG] llm_response_obj: {llm_response_obj!r}")
+                if llm_extraction_result is not None:
+                    print(f"[DEBUG] llm_extraction_result: {llm_extraction_result!r}")
+                provided_info = {}
 
-        print(f"Extracted info: {provided_info}")
-
-        updated_any_field = False
-        if "user_email" in provided_info and provided_info["user_email"] and not state.user_email:
-            state.user_email = provided_info["user_email"]
-            updated_any_field = True
-            print(f"Updated user_email: {state.user_email}")
-        if "document_id" in provided_info and provided_info["document_id"] and not state.document_id:
-            state.document_id = provided_info["document_id"]
-            updated_any_field = True
-            print(f"Updated document_id: {state.document_id}")
-            
-        if not updated_any_field and state.missing_fields:
-            state.messages.append(AIMessage(content="I'm sorry, I couldn't find the requested information in your message. Please try again. For example, 'Email: your@email.com, Document ID: 123'."))
-        elif updated_any_field:
-            state.messages.append(AIMessage(content="Thank you! Let me check those details."))
-            state.missing_fields = []
-            
     return state
 
 def orchestrator_node(state: AgentState) -> Command[str] | AgentState:
+    print(f"[DEBUG] orchestrator_node: current_plan = {state.current_plan}")
+    # QUICK FIX: If analysis is completed, route to output_handler
+    if state.current_plan.startswith("Analysis completed"):
+        return Command(goto="output_handler")
     """
     Decides the next logical step in the graph based on the current state and plan.
     Sets `state.next_node_after_validation` before routing to `validate_state`.
     """
     print(f"\n--- Running orchestrator_node ---")
     print(f"Current state: {state.dict()}")
-    
-    last_message = state.messages[-1] if state.messages else None
-    if isinstance(last_message, HumanMessage):
-        print(f"Processing human message: {last_message.content}")
-        
-        # For the first message, always try to start analysis
-        if len(state.messages) == 1:
-            state.next_node_after_validation = "start_analysis"
-            state.current_plan = "Starting analysis process."
-            return Command(goto="validate_state")
-            
+    print(f"orchestrator_node: state.messages = {state.messages}")
+    print(f"orchestrator_node: len(state.messages) = {len(state.messages)}")
+    for i, m in enumerate(state.messages):
+        print(f"  message[{i}]: type={getattr(m, 'type', None)}, content={getattr(m, 'content', None)}")
+
+    # Generalized: After any AI interruption for missing fields, next human message routes to process_user_input
+    is_human = False
+    if len(state.messages) >= 1:
+        last_message = state.messages[-1]
+        is_human = getattr(last_message, "type", None) == "human"
+
+    if is_human and len(state.messages) >= 2:
+        prev_message = state.messages[-2]
+        prev_is_ai = getattr(prev_message, "type", None) == "ai"
+        prev_content = getattr(prev_message, "content", "")
+        if prev_is_ai and "I need some more information to proceed." in prev_content:
+            from models import NODE_REQUIREMENTS
+            next_node = state.next_node_after_validation or "start_analysis"
+            required_fields = NODE_REQUIREMENTS.get(next_node, [])
+            missing = [field for field in required_fields if getattr(state, field, None) in (None, "")]
+            print(f"[DEBUG] Orchestrator set missing_fields: {missing} and next_node_after_validation: {next_node}")
+            print(f"[DEBUG] Orchestrator about to return to process_user_input with missing_fields: {missing}")
+            return Command(
+                goto="process_user_input",
+                update={
+                    "missing_fields": missing,
+                    "next_node_after_validation": next_node
+                }
+            )
+
+    if is_human:
+        print(f"Processing human message: {getattr(last_message, 'content', None)}")
+        # Only set next_node_after_validation if it is not already set (i.e., is None) and on the very first user message
+        if len(state.messages) == 1 and not state.next_node_after_validation:
+            return Command(
+                goto="validate_state",
+                update={
+                    "next_node_after_validation": "start_analysis",
+                    "current_plan": "Starting analysis process."
+                }
+            )
         # For subsequent messages, use LLM to decide
         if not state.missing_fields:
             llm_decision_prompt = ChatPromptTemplate.from_messages([
-                ("system", """You are an intelligent assistant. Based on the current conversation history and existing plan, determine the *next logical step* for the user's request.
-                Your response should be a single string from the following options:
-                - "start_analysis": If the user's intent is to analyze a document or similar.
-                - "perform_step_2": If analysis seems complete and the next logical step is a follow-up action.
-                - "end_conversation": If the task is complete or the user expresses a desire to end.
-                - "clarify_intent": If the user's intent is unclear or requires more information beyond specific fields.
-
-                Current plan: {current_plan}
-                Conversation history: {history}
-                """),
+                ("system", """You are an intelligent assistant. Based on the current conversation history and existing plan, determine the *next logical step* for the user's request.\n                Your response should be a single string from the following options:\n                - \"start_analysis\": If the user's intent is to analyze a document or similar.\n                - \"perform_step_2\": If analysis seems complete and the next logical step is a follow-up action.\n                - \"end_conversation\": If the task is complete or the user expresses a desire to end.\n                - \"clarify_intent\": If the user's intent is unclear or requires more information beyond specific fields.\n\n                Current plan: {current_plan}\n                Conversation history: {history}\n                """),
                 ("user", "User's current message: {latest_message}")
             ])
-            
             llm_chain = llm_decision_prompt | llm
-            
             history_str = "\n".join([f"{msg.type}: {msg.content}" for msg in state.messages[:-1]])
-            
             decision = llm_chain.invoke({
                 "current_plan": state.current_plan,
                 "history": history_str,
                 "latest_message": last_message.content
             }).content.strip().lower()
-
             print(f"Orchestrator decided: {decision}")
-            
             if "start_analysis" in decision:
-                state.next_node_after_validation = "start_analysis"
-                state.current_plan = "Starting analysis process."
-                return Command(goto="validate_state")
+                return Command(
+                    goto="validate_state",
+                    update={
+                        "next_node_after_validation": "start_analysis",
+                        "current_plan": "Starting analysis process."
+                    }
+                )
             elif "perform_step_2" in decision:
-                state.next_node_after_validation = "perform_step_2"
-                state.current_plan = "Proceeding with second step."
-                return Command(goto="validate_state")
+                return Command(
+                    goto="validate_state",
+                    update={
+                        "next_node_after_validation": "perform_step_2",
+                        "current_plan": "Proceeding with second step."
+                    }
+                )
             elif "end_conversation" in decision:
                 state.messages.append(AIMessage(content="It was a pleasure assisting you. Goodbye!"))
                 return Command(goto="output_handler")
@@ -211,65 +268,42 @@ def orchestrator_node(state: AgentState) -> Command[str] | AgentState:
     if state.next_node_after_validation:
         return Command(goto="validate_state")
     else:
-        if not state.messages or not isinstance(state.messages[-1], HumanMessage):
+        if not state.messages or not (is_human):
             state.messages.append(AIMessage(content="Hello! How can I assist you today?"))
         return state
 
-def create_graph():
-    """Create and return the graph for LangServe."""
-    workflow = StateGraph(AgentState)
-    
-    # Add input handling node
-    def handle_input(state: Dict[str, Any]) -> AgentState:
-        """Transform input into AgentState."""
-        print(f"\n--- Running handle_input ---")
-        print(f"Received input state: {state}")
-        
-        # Handle both string input and dict with 'input' key
-        input_text = state.get('input', state) if isinstance(state, dict) else state
-        
-        # Create initial state with the input message
-        initial_state = AgentState(
-            messages=[HumanMessage(content=str(input_text))],
-            current_plan="Starting new conversation"
-        )
-        
-        print(f"Created initial state: {initial_state.dict()}")
-        return initial_state
-    
-    # Add output handling node
-    def handle_output(state: AgentState) -> Dict[str, Any]:
-        """Transform AgentState into output format."""
-        print(f"\n--- Running handle_output ---")
-        print(f"Output state: {state.dict()}")
-        
-        if not state.messages:
-            return {"output": "No response generated", "state": state.dict()}
-        
-        last_message = state.messages[-1]
-        if isinstance(last_message, (HumanMessage, AIMessage)):
-            return {
-                "output": last_message.content,
-                "state": state.dict(),
-                "type": "message"
-            }
+def handle_output(state: AgentState) -> Dict[str, Any]:
+    """Transform AgentState into output format."""
+    print(f"\n--- Running handle_output ---")
+    print(f"Output state: {state.dict()}")
+
+    if not state.messages:
+        return {"output": "No response generated", "state": state.dict()}
+
+    last_message = state.messages[-1]
+    if isinstance(last_message, (HumanMessage, AIMessage)):
         return {
-            "output": str(last_message),
+            "output": last_message.content,
             "state": state.dict(),
-            "type": "text"
+            "type": "message"
         }
-    
-    # Add nodes
-    workflow.add_node("input_handler", handle_input)
+    return {
+        "output": str(last_message),
+        "state": state.dict(),
+        "type": "text"
+    }
+
+def create_graph():
+    workflow = StateGraph(AgentState)
+    # Add nodes (no input_handler)
     workflow.add_node("orchestrator", orchestrator_node)
     workflow.add_node("validate_state", validate_state_and_interrupt)
     workflow.add_node("process_user_input", process_user_input)
     workflow.add_node("start_analysis", start_analysis)
     workflow.add_node("perform_step_2", perform_step_2)
     workflow.add_node("output_handler", handle_output)
-    
-    # Add edges
-    workflow.add_edge("input_handler", "orchestrator")
+
+    # Edges (no edge from input_handler)
     workflow.add_conditional_edges(
         "orchestrator",
         lambda x: x.goto if isinstance(x, Command) else "output_handler",
@@ -288,13 +322,13 @@ def create_graph():
             "orchestrator": "orchestrator"
         }
     )
-    workflow.add_edge("process_user_input", "validate_state")
+    workflow.add_edge("process_user_input", "orchestrator")
     workflow.add_edge("start_analysis", "output_handler")
     workflow.add_edge("perform_step_2", "output_handler")
-    
-    # Set entry point
-    workflow.set_entry_point("input_handler")
-    
+
+    # Set entry point to orchestrator
+    workflow.set_entry_point("orchestrator")
+
     return workflow.compile()
 
 app = create_graph()
