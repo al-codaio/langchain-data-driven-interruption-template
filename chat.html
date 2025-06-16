@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Chatbot Demo</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2em; }
+    #chat { border: 1px solid #ccc; padding: 1em; height: 300px; overflow-y: auto; margin-bottom: 1em; }
+    .user { color: blue; }
+    .bot { color: green; }
+  </style>
+</head>
+<body>
+  <h2>Chatbot Demo</h2>
+  <div id="chat"></div>
+  <form id="chatForm">
+    <input type="text" id="userInput" autocomplete="off" placeholder="Type your message..." style="width: 70%;" required />
+    <button type="submit">Send</button>
+  </form>
+  <script>
+    const chatDiv = document.getElementById('chat');
+    const form = document.getElementById('chatForm');
+    const input = document.getElementById('userInput');
+    let history = [];
+
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const userMsg = input.value;
+      history.push({type: "human", content: userMsg});
+      chatDiv.innerHTML += `<div class="user"><b>You:</b> ${userMsg}</div>`;
+      input.value = "";
+
+      // Send to backend
+      const response = await fetch('/chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ messages: history })
+      });
+      const data = await response.json();
+      // Assume the output is in data.output or data.state.messages
+      let botMsg = data.output;
+      if (!botMsg && data.state && data.state.messages) {
+        const last = data.state.messages[data.state.messages.length - 1];
+        botMsg = last && last.content ? last.content : "(no response)";
+      }
+      chatDiv.innerHTML += `<div class="bot"><b>Bot:</b> ${botMsg}</div>`;
+      chatDiv.scrollTop = chatDiv.scrollHeight;
+      // Optionally update history with bot message
+      history.push({type: "ai", content: botMsg});
+    };
+  </script>
+</body>
+</html>
