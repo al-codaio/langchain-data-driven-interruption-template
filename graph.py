@@ -88,88 +88,57 @@ def perform_step_2(state: AgentState) -> AgentState:
 
 def process_user_input(state: AgentState) -> AgentState:
     """
-    This node processes the user's response after an interrupt.
-    It expects the user to provide the missing fields.
+    Process user input to collect missing required fields.
+    Accepts either a direct value (e.g., "myemail@example.com") or a JSON object.
     """
-    print(f"[DEBUG] process_user_input entered with missing_fields: {state.missing_fields}")
-    
+    if not state.missing_fields:
+        return state
+
     last_message = state.messages[-1]
-    print(f"[DEBUG] last_message type: {type(last_message)}, content: {getattr(last_message, 'content', None)}")
-    is_human = False
-    if isinstance(last_message, HumanMessage):
-        is_human = True
-    elif isinstance(last_message, BaseMessage) and getattr(last_message, 'type', None) == 'human':
-        is_human = True
+    if not isinstance(last_message, HumanMessage):
+        return state
 
-    if not state.missing_fields and state.next_node_after_validation:
-        from models import NODE_REQUIREMENTS
-        state.missing_fields = NODE_REQUIREMENTS.get(state.next_node_after_validation, [])
+    user_input = last_message.content.strip()
+    
+    # Try to parse as JSON first
+    try:
+        if user_input.startswith('{'):
+            data = json.loads(user_input)
+            # Update state with any provided fields
+            for field in state.missing_fields:
+                if field in data:
+                    setattr(state, field, data[field])
+        else:
+            # If not JSON, assume it's a direct value for the first missing field
+            setattr(state, state.missing_fields[0], user_input)
+    except json.JSONDecodeError:
+        # If JSON parsing fails, treat as direct value
+        setattr(state, state.missing_fields[0], user_input)
 
-    if is_human:
-        user_response = last_message.content
-        print(f"User response received: '{user_response}'")
-
-        extraction_prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a helpful assistant that extracts information from user messages.\nExtract the following fields from the user's message: {fields_to_extract}.\nRespond ONLY with a valid JSON object using the field names as keys. If a field is not found, omit it.\nDo not include any explanation or extra text.\n"""),
-            ("user", "User message: {user_message}")
-        ])
-        extraction_llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini"), temperature=0.0)
-        
-        fields_to_extract_str = ", ".join(state.missing_fields)
-        print(f"[DEBUG] fields_to_extract_str before extraction: {fields_to_extract_str}")
-        if fields_to_extract_str:
-            prompt_value = None
-            llm_response_obj = None
-            llm_extraction_result = None
-            updated_any_field = False
-            try:
-                print(f"[DEBUG] Extraction prompt input: fields_to_extract={fields_to_extract_str}, user_message={user_response}")
-                prompt_value = extraction_prompt.format_prompt(fields_to_extract=fields_to_extract_str, user_message=user_response)
-                print(f"[DEBUG] prompt_value assigned")
-                llm_response_obj = extraction_llm.invoke(prompt_value)
-                print(f"[DEBUG] llm_response_obj assigned")
-                print(f"[DEBUG] Full LLM response object: {llm_response_obj!r}")
-                llm_extraction_result = getattr(llm_response_obj, "content", None)
-                print(f"[DEBUG] Raw LLM extraction result: {llm_extraction_result!r}")
-                provided_info = json.loads(llm_extraction_result.strip().strip('`').strip('json'))
-                print(f"Extracted info: {provided_info}")
-                user_email = provided_info.get("user_email")
-                if user_email and not state.user_email:
-                    state.user_email = user_email
-                    updated_any_field = True
-                if "document_id" in provided_info and provided_info["document_id"] and not state.document_id:
-                    print(f"[DEBUG] Setting state.document_id = {provided_info['document_id']}")
-                    state.document_id = provided_info["document_id"]
-                    updated_any_field = True
-                
-                if not updated_any_field and state.missing_fields:
-                    state.messages.append(AIMessage(content="I'm sorry, I couldn't find the requested information in your message. Please try again. For example, 'Email: your@email.com, Document ID: 123'."))
-                    return state
-                elif updated_any_field:
-                    state.messages.append(AIMessage(content="Thank you! Let me check those details."))
-                    state.missing_fields = []
-                    # Route to orchestrator to continue the flow, and persist updated fields
-                    return Command(
-                        goto="orchestrator",
-                        update={
-                            "user_email": state.user_email,
-                            "document_id": state.document_id,
-                            "missing_fields": [],
-                            "messages": state.messages,
-                        }
-                    )
-            except Exception as e:
-                print(f"LLM extraction error: {e!r}")
-                traceback.print_exc()
-                if prompt_value is not None:
-                    print(f"[DEBUG] prompt_value: {prompt_value!r}")
-                if llm_response_obj is not None:
-                    print(f"[DEBUG] llm_response_obj: {llm_response_obj!r}")
-                if llm_extraction_result is not None:
-                    print(f"[DEBUG] llm_extraction_result: {llm_extraction_result!r}")
-                provided_info = {}
-
-    return state
+    # Check if we still have missing fields
+    still_missing = [field for field in state.missing_fields 
+                    if not getattr(state, field)]
+    
+    if still_missing:
+        # Ask for the next missing field
+        state.messages.append(AIMessage(
+            content=f"Please provide your {still_missing[0].replace('_', ' ')}"
+        ))
+        state.missing_fields = still_missing
+        return state
+    
+    # All fields collected, proceed
+    state.messages.append(AIMessage(content="Thank you! Let me process that."))
+    state.missing_fields = []
+    return Command(
+        goto="orchestrator",
+        update={
+            "user_email": state.user_email,
+            "document_id": state.document_id,
+            "missing_fields": [],
+            "messages": state.messages,
+        }
+    )
 
 def orchestrator_node(state: AgentState) -> Command[str] | AgentState:
     print(f"[DEBUG] orchestrator_node: current_plan = {state.current_plan}")

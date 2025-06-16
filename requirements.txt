@@ -7,3 +7,4 @@ python-dotenv>=1.0.0
 pydantic>=2.5.2
 typing-extensions>=4.8.0
 sse-starlette>=1.8.2
+langgraph-cli[inmem]
