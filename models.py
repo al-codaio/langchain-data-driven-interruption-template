@@ -1,6 +1,6 @@
-from typing import List, Optional
+from typing import List, Optional, Union
 from pydantic import BaseModel, Field
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 
 class AgentState(BaseModel):
     messages: List[BaseMessage] = Field(default_factory=list)
@@ -10,6 +10,9 @@ class AgentState(BaseModel):
     next_node_after_validation: Optional[str] = None
     current_plan: str = "" 
     analysis_result: Optional[str] = None
+
+class StringInput(BaseModel):
+    input: str
 
 NODE_REQUIREMENTS = {
     "start_analysis": ["user_email", "document_id"],
