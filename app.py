@@ -7,7 +7,6 @@ from fastapi import FastAPI, HTTPException
 from langserve import add_routes
 from langchain_core.messages import BaseMessage, HumanMessage
 from typing import List, Optional, Dict, Any
-from pydantic import Field
 
 from graph import create_graph
 from models import AgentState
